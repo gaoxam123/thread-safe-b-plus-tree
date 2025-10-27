@@ -90,7 +90,7 @@ int main() {
             for (size_t i = startValue; i < limit; ++i) {
                 key_store[i] = encode_u64_be(i);
                 val_store[i] = encode_u64_be(2 * i);
-                tree.insert(make_ba(key_store[i]), make_ba(val_store[i]));
+                tree.put(make_ba(key_store[i]), make_ba(val_store[i]));
             }
 
             // Read them back

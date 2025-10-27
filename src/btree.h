@@ -215,7 +215,7 @@ struct Btree {
     }
 
     // Insert a new entry into the tree
-    void insert(const KeyT &key, const ValueT &value) {
+    void put(const KeyT &key, const ValueT &value) {
         // Global lock for cases where the root is updated
         global_mutex.lock();
 
