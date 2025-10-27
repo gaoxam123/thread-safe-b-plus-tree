@@ -2,6 +2,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <algorithm>
+#include <mutex>
 
 template<typename KeyT, typename ValueT, typename ComparatorT, std::size_t kCapacity>
 struct Btree {
@@ -9,12 +10,15 @@ struct Btree {
         // Level in the tree
         uint16_t level;
         // Number of children
-        uint16_t key_count;
+        uint16_t children_count;
         // Lock for each node
         mutable std::shared_mutex mtx;
 
         // Constructor
-        Node(uint16_t level, uint16_t key_count) : level(level), key_count(key_count) {}
+        Node(uint16_t level, uint16_t children_count) : level(level), children_count(children_count) {}
+
+        // Destructor
+        virtual ~Node() = default;
 
         // Manual locking
         void lock_read() const    { mtx.lock_shared(); }
@@ -37,15 +41,15 @@ struct Btree {
         // Constructor
         InnerNode() : Node(1, 0) {}
 
-        // Get the index of the first key that is not less than than a provided key
+        // Get the index of the first key that is not less than a provided key
         std::pair<uint32_t, bool> lower_bound(const KeyT &key) {
-            if (this->key_count == 0) {
+            if (this->children_count == 0) {
                 return {0, false};
             }
 
             const ComparatorT comparator{};
 
-            int left = 0, right = this->key_count - 2;
+            int left = 0, right = this->children_count - 2;
             int index_found = -1;
             while (left <= right) {
                 int mid = (left + right) >> 1;
@@ -59,7 +63,7 @@ struct Btree {
             }
 
             if (index_found == -1) {
-                return {this->key_count - 1, false};
+                return {this->children_count - 1, false};
             }
             return {index_found, true};
         }
@@ -68,24 +72,24 @@ struct Btree {
         void insert_split(const KeyT &key, Node* split_child) {
             uint32_t index = lower_bound(key).first;
 
-            for (size_t i = this->key_count - 1; i > index; i--) {
+            for (size_t i = this->children_count - 1; i > index; i--) {
                 keys[i] = keys[i - 1];
                 children[i + 1] = children[i];
             }
             keys[index] = key;
             children[index + 1] = split_child;
-            this->key_count++;
+            this->children_count++;
         }
 
         // Split a node
         KeyT split(InnerNode* right_neighbor) {
-            int mid_key_index = (this->key_count - 1) / 2;
+            int mid_key_index = (this->children_count - 1) / 2;
             
             int left_count = mid_key_index + 1;
-            int right_count = this->key_count - left_count;
+            int right_count = this->children_count - left_count;
 
-            this->key_count = left_count;
-            right_neighbor->key_count = right_count;
+            this->children_count = left_count;
+            right_neighbor->children_count = right_count;
 
             std::copy(keys + mid_key_index + 1, keys + mid_key_index + 1 + right_count, right_neighbor->keys);
             std::copy(children + mid_key_index + 1, children + mid_key_index + 1 + right_count, right_neighbor->children);
@@ -103,14 +107,14 @@ struct Btree {
         // Constructor
         LeafNode() : Node(0, 0) {}
 
-        // Get the index of the first key that is not less than than a provided key
+        // Get the index of the first key that is not less than a provided key
         std::pair<uint32_t, bool> lower_bound(const KeyT &key) {
-            if (this->key_count == 0) {
+            if (this->children_count == 0) {
                 return {0, false};
             }
 
-            int left = 0, right = this->key_count - 1;
-            int index_found = this->key_count;
+            int left = 0, right = this->children_count - 1;
+            int index_found = this->children_count;
 
             const ComparatorT comparator{};
 
@@ -126,7 +130,7 @@ struct Btree {
             }
 
             bool found = false;
-            if (index_found < static_cast<int>(this->key_count)) {
+            if (index_found < static_cast<int>(this->children_count)) {
                 found = !comparator(keys[index_found], key) &&
                         !comparator(key, keys[index_found]);
             }
@@ -141,24 +145,24 @@ struct Btree {
                 return;
             }
 
-            for (uint32_t i = this->key_count; i > index; i--) {
+            for (uint32_t i = this->children_count; i > index; i--) {
                 keys[i] = keys[i - 1];
                 values[i] = values[i - 1];
             }
             keys[index] = key;
             values[index] = value;
-            this->key_count++;
+            this->children_count++;
         }
 
         // Split a node
         KeyT split(LeafNode* right_neighbor) {
-            int mid_key_index = this->key_count / 2;
+            int mid_key_index = this->children_count / 2;
 
             int left_count = mid_key_index + 1;
-            int right_count = this->key_count - left_count;
+            int right_count = this->children_count - left_count;
 
-            this->key_count = left_count;
-            right_neighbor->key_count = right_count;
+            this->children_count = left_count;
+            right_neighbor->children_count = right_count;
 
             std::copy(keys + mid_key_index + 1, keys + mid_key_index + 1 + right_count, right_neighbor->keys);
             std::copy(values + mid_key_index + 1, values + mid_key_index + 1 + right_count, right_neighbor->values);
@@ -178,7 +182,11 @@ struct Btree {
     }
 
     // Destructor
-    ~Btree() = default;
+    ~Btree() {
+        std::unique_lock<std::shared_mutex> g(global_mutex);
+        delete_subtree(root);
+        root = nullptr;
+    }
 
     // Lookup an entry in the tree
     std::optional<ValueT> get(const KeyT &key) {
@@ -236,7 +244,7 @@ struct Btree {
         if (current_node->is_leaf()) {
             LeafNode* leafNode = static_cast<LeafNode*>(current_node);
             // Need to split the node
-            if (kCapacity <= leafNode->key_count) {
+            if (kCapacity <= leafNode->children_count) {
                 LeafNode* right_neighbor_node;
                 InnerNode* new_root;
                 right_neighbor_node = new LeafNode();
@@ -252,7 +260,7 @@ struct Btree {
                 InnerNode* parent_node = new_root;
 
                 parent_node->level = 1;
-                parent_node->key_count = 1;
+                parent_node->children_count = 1;
                 parent_node->children[0] = root;
                 parent_node->insert_split(separator_key, right_neighbor_node);
                 parent_node->unlock_write();
@@ -282,7 +290,7 @@ struct Btree {
         else {
             InnerNode* innerNode = static_cast<InnerNode*>(current_node);
             // Need to split the node
-            if (kCapacity <= innerNode->key_count) {
+            if (kCapacity <= innerNode->children_count) {
                 InnerNode* right_neighbor_node;
                 InnerNode* new_root;
                 right_neighbor_node = new InnerNode();
@@ -305,7 +313,7 @@ struct Btree {
                 // Create a new root
                 InnerNode* parent_node = new_root;
                 parent_node->level = innerNode->level + 1;
-                parent_node->key_count = 1;
+                parent_node->children_count = 1;
                 parent_node->children[0] = root;
                 root = new_root;
                 parent_node->insert_split(separator_key, right_neighbor_node);
@@ -322,7 +330,7 @@ struct Btree {
                 if (innerNode->level == 1) {
                     LeafNode* child_node_leaf = static_cast<LeafNode*>(child_node);
                     // Need to split the node
-                    if (kCapacity <= child_node_leaf->key_count) {
+                    if (kCapacity <= child_node_leaf->children_count) {
                         LeafNode* right_neighbor_node;
                         right_neighbor_node = new LeafNode();
                         right_neighbor_node->lock_write();
@@ -347,7 +355,7 @@ struct Btree {
                 
                 InnerNode* child_node_inner = static_cast<InnerNode*>(child_node);
                 // Need to split the node
-                if (kCapacity <= child_node_inner->key_count) {
+                if (kCapacity <= child_node_inner->children_count) {
                     InnerNode* right_neighbor_node;
                     right_neighbor_node = new InnerNode();
                     right_neighbor_node->lock_write();
@@ -367,5 +375,16 @@ struct Btree {
                 current_node = child_node_inner;
             }
         }
+    }
+private:
+    static void delete_subtree(Node* n) {
+        if (!n) return;
+        if (!n->is_leaf()) {
+            auto* in = static_cast<InnerNode*>(n);
+            for (uint16_t i = 0; i < in->children_count; i++) {
+                delete_subtree(in->children[i]);
+            }
+        }
+        delete n;
     }
 };
